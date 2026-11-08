@@ -64,7 +64,3 @@ It is shared as is, for reference. It is built around my yard, my entity names a
 * **Photo eyes are not a safety net here.** The mower spends about a minute turning near the dock before it drives out, so a door that closes too early just shuts in front of it.
 
 The descriptions and `note:` fields in each file explain why each step exists.
-
-## Use of AI
-
-I built and debugged this with help from Claude (Anthropic), working against my live Home Assistant instance. All testing was done on the real mower and door.
