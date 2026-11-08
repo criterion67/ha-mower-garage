@@ -1,0 +1,106 @@
+mower_full_yard_chain:
+  alias: Mower Full Yard Chain (Start)
+  description: |-
+    Starts a CHAINED whole-yard run: three separate single-zone sessions, Rear then Front then Side, each ending in a normal return and dock. This script only starts LEG ONE. automation.mower_chain_advance owns every step after that and reads input_select.mower_chain_leg to know where it is.
+
+    WHY CHAINED RATHER THAN ONE MULTI-ZONE JOB: a single job with zone_ids [3, 1, 2] failed on 2026-08-18, 2026-08-19 and again on 2026-08-20. The 2026-08-20 run was fully clean, with Zone mode held throughout and no restarts, and the mower STILL finished the rear yard, drove to the garage door as if to dock, then went to the side yard and reported "Some zones unreachable". Scott watched it happen. Multi-zone chaining inside this mower does not work, so the chain is done in Home Assistant instead, one zone per session.
+
+    DOES NOT SET input_boolean.mower_full_yard_cycle, deliberately. That marker exists to enable the mid-mow close-the-gate prompt in automation.mower_gate_reminders, which fires off sensor.jason_momower_current_zone. That sensor has now falsely reported "Front Yard (#1)" twice while the mower was physically heading elsewhere, on 2026-08-18 for 98 seconds and on 2026-08-20 for 84 seconds. In the chained design the gate prompt instead fires when leg one DOCKS, which is a real event with no time pressure. Do not add the marker back without a reason.
+
+    PRE-FLIGHTS RUN BEFORE THE LEG POINTER IS SET, deliberately, so a refusal leaves the chain at Idle with nothing to clean up.
+
+    NOTIFY WRAPPER 2026-09-22: every direct notify.mobile_app_* call was replaced by script.notify_alert (or script.notify_clear for clear_notification) with the same values. Delivery behavior is unchanged.
+  fields: {}
+  icon: mdi:robot-mower
+  mode: single
+  sequence:
+  - alias: Refuse if a chain is already in progress
+    if:
+    - condition: not
+      conditions:
+      - condition: state
+        entity_id: input_select.mower_chain_leg
+        state: Idle
+    note: Fails closed. Starting a second chain over a running one would double up legs and fight over the garage door.
+    then:
+    - action: script.notify_alert
+      alias: Tell Scott a chain is already running
+      data:
+        message: A chained whole yard run is already in progress. The current leg is {{ states('input_select.mower_chain_leg') }}. Nothing was started. Set the leg back to Idle first if you really want to restart the chain.
+        title: Chain Already Running
+        tag: mower_chain
+        channel: Quiet Notices
+        importance: low
+        priority: high
+        ttl: 0
+        sticky: true
+        icon: mdi:alert-circle-outline
+    - stop: A chain is already in progress.
+  - action: select.select_option
+    alias: Force Zone mode before anything else
+    data:
+      option: Zone
+    note: The mower only honours a zone list while select.jason_momower_mowing_action reads Zone, and this does NOT survive a restart or integration reload. Set it every run, never assume it.
+    target:
+      entity_id: select.jason_momower_mowing_action
+  - alias: Let the mode settle before reading it back
+    delay:
+      seconds: 6
+    note: This integration can return success on a write that never reached the mower. The read back below is the only trustworthy confirmation and it needs settling time.
+  - alias: Refuse unless the mower confirms Zone mode
+    if:
+    - alias: Mowing action does NOT read Zone
+      condition: not
+      conditions:
+      - condition: state
+        entity_id: select.jason_momower_mowing_action
+        state: Zone
+    then:
+    - action: script.notify_alert
+      alias: Tell Scott nothing was started
+      data:
+        message: Jason MoMower would not switch to Zone mode. Mowing action reads {{ states('select.jason_momower_mowing_action') }}. The chain was not started and the garage door was not touched.
+        title: Chain Not Started, Mode Did Not Take
+        tag: mower_mode
+        channel: Quiet Notices
+        importance: low
+        priority: high
+        ttl: 0
+        sticky: true
+        icon: mdi:alert-circle-outline
+    - stop: Mowing action would not confirm Zone mode, so the zone list would have been ignored.
+  - alias: Refuse unless the rear yard gate is confirmed OPEN
+    if:
+    - condition: not
+      conditions:
+      - condition: state
+        entity_id: binary_sensor.rear_yard_gate
+        state: 'on'
+    note: 'Written as a NOT wrapping state ''on'' so it fails CLOSED: off, unavailable and unknown all block. A dead gate sensor battery must never let a rear yard job start. binary_sensor.rear_yard_gate reads on = OPEN.'
+    then:
+    - action: script.notify_alert
+      alias: Tell Scott the gate is not confirmed open
+      data:
+        message: The rear yard gate reads {{ states('binary_sensor.rear_yard_gate') }}. The rear yard is unreachable with the gate shut, so the chain was not started. Open the gate and try again.
+        title: Chain Not Started, Gate Not Open
+        tag: mower_gate
+        channel: Quiet Notices
+        importance: low
+        priority: high
+        ttl: 0
+        sticky: true
+        icon: mdi:gate-alert
+    - stop: Rear yard gate did not read open.
+  - action: input_select.select_option
+    alias: Point the chain at leg one
+    data:
+      option: Rear Yard
+    note: Set AFTER both pre-flights so a refusal never leaves a stranded pointer. automation.mower_chain_advance reads this to decide what comes next when the mower docks.
+    target:
+      entity_id: input_select.mower_chain_leg
+  - action: script.mower_zone_cycle
+    alias: Run leg one, the rear yard, as its own single zone session
+    data:
+      zone_ids:
+      - 3
+    note: Single zone on purpose. script.mower_zone_cycle owns the garage door choreography, its own duplicate mode and gate pre-flights, and the 120 second undock clearance wait. That redundancy is intentional and cheap.

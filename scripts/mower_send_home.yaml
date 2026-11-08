@@ -1,0 +1,44 @@
+mower_send_home:
+  alias: Mower Send Home
+  description: |-
+    Cancels the current mowing session and brings Jason MoMower back to the dock, opening the garage door first.
+
+    WHY THIS EXISTS RATHER THAN JUST CALLING lawn_mower.dock
+    The dock action runs a stop-then-dock sequence: it ends the session before returning. That means binary_sensor.jason_momower_returning never fires on this path, so the returning trigger in automation.mower_garage_return does not run and the garage door would stay shut. Verified 2026-08-11: a manual lawn_mower.dock produced a 2 min 35 sec return with the returning flag off the entire time.
+
+    WHAT IT DOES
+    1. Raises input_boolean.mower_cycle_active. This suppresses the garage door TTS and notification automation, stops the garage climate automation shutting off the AC and heater, and, importantly, arms the docked trigger in automation.mower_garage_return so the door still closes automatically once the mower is home. Raising it also covers the case where the mow was started from the MOVAhome app rather than from Home Assistant.
+    2. Opens the garage door and stops it after 2.5 seconds for a 21 inch opening.
+    3. Sends lawn_mower.dock to end the session and bring the mower back.
+
+    The door is deliberately opened before the dock command even though the return takes minutes, so there is no chance of the mower arriving first.
+
+    After the mower docks, automation.mower_garage_return handles the rest: 30 second settle, close the door, clear the flag, notify.
+
+    SAFE TO RUN WHEN ALREADY DOCKED: the integration's stop-then-dock helper skips the stop when the mower is not in an active session state, so this just opens the door and issues a harmless dock command.
+  fields: {}
+  icon: mdi:home-import-outline
+  mode: single
+  sequence:
+  - action: input_boolean.turn_on
+    alias: Raise the suppression flag so the door still closes after docking
+    target:
+      entity_id: input_boolean.mower_cycle_active
+  - action: cover.open_cover
+    alias: Start the door opening
+    target:
+      entity_id: cover.garage_door
+  - alias: Wait the calibrated interval for a 21 inch opening
+    delay:
+      milliseconds: 2500
+  - action: cover.stop_cover
+    alias: Stop the door partway
+    target:
+      entity_id: cover.garage_door
+  - alias: Let the door settle before commanding the mower
+    delay:
+      seconds: 3
+  - action: lawn_mower.dock
+    alias: End the session and send the mower home
+    target:
+      entity_id: lawn_mower.jason_momower
