@@ -1,0 +1,184 @@
+mower_zone_cycle:
+  alias: Mower Zone Cycle (Outbound)
+  description: |-
+    ZONE MODE PRE-FLIGHT ADDED 2026-08-18, and it is now the FIRST thing this script does. The mower only honours a zone list while select.jason_momower_mowing_action reads Zone. In All area mode the zone list is ignored and the mower runs its own whole-map plan. On 2026-08-18 a [3, 1, 2] job ran with the mode on All area the entire time: it mowed the rear yard, skipped the front yard, mowed the side yard, and docked at 64.5 percent of the whole map with 56 percent battery and no error. The script now sets Zone, waits 6 seconds, READS IT BACK, and refuses to go any further unless the mower confirms it. The read-back is not optional paranoia: this integration can return success on a write that never reached the mower, so an unverified write must be treated as failed. The guard runs before the gate pre-flight, before the suppression flag, and before any door movement, so a refusal leaves nothing to clean up.
+
+    Outbound half of the MOVA LiDAX Ultra 2000 AWD garage sequence. Called by the zone buttons on the Robots view of the Mobile dashboard with a zone_ids list.
+
+    GATE PRE-FLIGHT ADDED 2026-08-17: if the requested zone_ids include zone 3, this script refuses to run unless binary_sensor.rear_yard_gate reads exactly "on" (open). It fails closed on "unavailable" and "unknown" too, so a dead sensor battery or weak signal blocks the run rather than silently passing. The check runs before the suppression flag is raised.
+
+    WHAT IT DOES
+    1. Raises input_boolean.mower_cycle_active, which suppresses the garage door TTS and notification automation and stops the garage climate automation from shutting off the AC and heater during the cycle.
+    2. Opens the garage door and stops it after 2.5 seconds, which produces a 21 inch opening. Measured 2026-08-11: door travel is a linear 8.4 in/s, and a 5 second gap gave 42 inches. The mower is about 12 inches tall, so this leaves roughly 9 inches of clearance. The Athom opener exposes no position control, so a timed stop pulse is the only way to reach a partial opening.
+    3. Starts a zone mow on the requested zones.
+    4. Waits up to 5 minutes for the mower to physically leave the dock (docked flag going off).
+    5. On success, waits 120 seconds for the mower to clear the doorway, then closes the door. MEASURED 2026-08-12 on the first live run: the mower backs out of the dock and stops within about 5 seconds, then turns 180 degrees counterclockwise and takes roughly 60 more seconds finishing its positioning before it is ready to move, then about 10 seconds to actually leave the garage. That is about 75 seconds from the docked flag clearing to the mower being outside. The original 60 second delay closed the door while the mower was still positioning, so it is now 120 seconds, leaving roughly 45 seconds of margin.
+    6. On timeout, sends lawn_mower.dock to cancel the session so the mower cannot wake up later and drive into a closed door, closes the door, and notifies Scott's Pixel 9.
+
+    The flag is deliberately left ON at the end of a successful run. It is cleared by the companion automation Mower Garage Return after the mower docks, so the return leg door movements stay suppressed too.
+
+    GUARD ADDED 2026-08-17: step 2 now only runs when cover.garage_door is actually closed. A second open_cover pulse on an already open or partly open door reverses it shut on this opener, which stranded the mower outside on 2026-08-17. If the door is already open, the script skips the open pulse and carries straight on to the mow command.
+
+    SAFETY, IMPORTANT CORRECTION: the opener photo eyes are NOT a sufficient backstop for a delay that is too short. The beam only reverses the door if the mower is already in the doorway at the moment the door closes. During the long positioning pause the mower is still back near the dock and nowhere near the beam, so the door closes uneventfully and the mower then drives into a shut door a minute later. This is exactly what happened on the first run. The delay must comfortably exceed the full positioning time; the photo eyes only cover the brief window when the mower is physically in the opening.
+
+    CONTINUE_ON_ERROR ADDED 2026-08-25 to the start_zone_mowing step. That service can raise AFTER the mower has actually started, because its internal verification window closes before the mower reports the task. On 2026-08-25 it raised at 08:11:49 while the mower undocked at 08:11:52, and the raise killed the script before the door close, leaving the garage open. The undock wait immediately after is the honest verification and it fails safe on timeout, so suppressing this raise loses no safety. Do not remove continue_on_error without replacing it with something that still guarantees the door close runs.
+
+    DOOR CLOSE MOVED OUT 2026-08-25. The success path no longer closes the garage door. automation.mower_outbound_door_close now owns that, triggered by the docked flag going off, so it survives this script being killed mid-sequence and survives a Home Assistant restart. The fail-safe close in the THEN branch, for when the mower never undocks at all, deliberately REMAINS here, because no undock means no trigger for the automation. Do not add a close back into the success path: two close pulses on this opener can drive the door back open.
+
+    RACE CONDITION FIXED 2026-09-01, and it was the cause of every short session. The undock wait was a wait_for_trigger, which only sees transitions that happen after it arms. When start_zone_mowing blocked long enough for the mower to undock first, the wait missed the transition, ran its full five minute timeout, and fell into the fail-safe branch, which sent lawn_mower.dock into a perfectly healthy mowing session. The mower was not faulty and neither was the integration. The step is now a wait_template, which evaluates immediately and passes when the mower is already off the dock. Full evidence is in the note on that step.
+
+    NOTIFY WRAPPER 2026-09-22: every direct notify.mobile_app_* call was replaced by script.notify_alert (or script.notify_clear for clear_notification) with the same values. Delivery behavior is unchanged.
+  fields:
+    zone_ids:
+      description: Zone ids to mow. Zone 1 is the front yard, Zone 2 the side yard, Zone 3 the rear yard. Pass a list, for example [1] or [1, 2].
+      example: '[1, 2]'
+      name: Zone ids
+      required: true
+      selector:
+        object: null
+  icon: mdi:robot-mower
+  mode: single
+  sequence:
+  - alias: Put the mower into Zone mode before anything else happens
+    note: Added 2026-08-18. This runs FIRST, ahead of the gate pre-flight, the suppression flag and any door movement, so a failure here leaves absolutely no state behind to clean up.
+    action: select.select_option
+    target:
+      entity_id: select.jason_momower_mowing_action
+    data:
+      option: Zone
+  - alias: Give the mower time to accept the mode and report it back
+    note: The integration can return success on a write that never reached the mower. On 2026-08-18 a select_option came back unverified, Home Assistant showed Zone optimistically, and a later device poll reverted it to All area. The read-back below is the only trustworthy confirmation, and it needs a few seconds of settling first.
+    delay:
+      seconds: 6
+  - alias: Refuse to continue unless the mower actually confirms Zone mode
+    note: 'WHY THIS EXISTS. On 2026-08-18 a Full Yard run sent zone_ids [3, 1, 2] while select.jason_momower_mowing_action read All area for the entire session. The mower ignored the zone list and executed its own all-area plan: it mowed the rear yard, skipped the front yard, mowed the side yard, then docked at 64.5 percent of the WHOLE MAP (534.13 of 827.85 m2, a whole-map denominator) with 56 percent battery and no error raised. Nothing in Home Assistant noticed. Zone selection only exists while the mower is in Zone mode; in All area mode the zone list is meaningless. Fails CLOSED on ''All area'', ''Edge'', ''Spot'', ''unavailable'' and ''unknown'' alike, because anything other than an explicit Zone reading means the job about to be sent would not do what the button says.'
+    if:
+    - alias: Mowing action does NOT read Zone
+      condition: not
+      conditions:
+      - condition: state
+        entity_id: select.jason_momower_mowing_action
+        state: Zone
+    then:
+    - alias: Tell Scott nothing was started and why
+      action: script.notify_alert
+      data:
+        message: Jason MoMower would not switch to Zone mode. Mowing action reads {{ states('select.jason_momower_mowing_action') }}. Nothing was started, the garage door was not touched, and no flags were set. In All area mode the mower ignores the zone list and mows its own plan, which is what silently skipped the front yard on 18 August.
+        title: Mowing Not Started, Mode Did Not Take
+        tag: mower_mode
+        channel: Quiet Notices
+        importance: low
+        priority: high
+        ttl: 0
+        persistent: true
+        sticky: true
+        icon: mdi:alert-circle-outline
+    - alias: Say it out loud
+      action: tts.speak
+      target:
+        entity_id: tts.home_assistant_cloud
+      data:
+        media_player_entity_id: media_player.bedroom_group
+        cache: false
+        message: Mowing did not start. Jason MoMower would not switch to zone mode.
+    - stop: Mowing action would not confirm Zone mode, so the zone list would have been ignored.
+  - alias: Refuse to start any rear yard job unless the gate reads OPEN
+    note: 'Added 2026-08-17. Applies to ANY call that includes zone 3, so it covers the Rear Yard button, the Full Yard preset, and anything added later, without duplicating the check per button. Deliberately fails CLOSED: it proceeds only when binary_sensor.rear_yard_gate reads exactly "on" (open). A dead sensor battery or poor signal gives "unavailable" or "unknown", and a check written as "is it closed" would sail straight through that and send the mower to a zone it cannot enter. This runs BEFORE the suppression flag is raised, so a refusal leaves no state behind to clean up. The zone_ids membership test needs a template because zone_ids is a script variable and no native condition can test list membership.'
+    if:
+    - condition: template
+      value_template: '{{ 3 in (zone_ids | default([])) }}'
+      alias: Only when the rear yard is part of this job
+    - condition: not
+      alias: Gate does NOT read open
+      conditions:
+      - condition: state
+        entity_id: binary_sensor.rear_yard_gate
+        state: 'on'
+    then:
+    - action: script.notify_alert
+      alias: Tell Scott why nothing started
+      data:
+        message: The rear yard was requested but the side gate is not reading open. It currently reads {{ states("binary_sensor.rear_yard_gate") }}. If that is unavailable or unknown, check the contact sensor battery and signal.
+        title: Mowing Not Started, Check The Gate
+        tag: mower_gate
+        channel: Quiet Notices
+        importance: low
+        priority: high
+        ttl: 0
+        persistent: true
+        sticky: true
+        icon: mdi:gate-alert
+    - action: tts.speak
+      alias: Say it out loud
+      target:
+        entity_id: tts.home_assistant_cloud
+      data:
+        media_player_entity_id: media_player.bedroom_group
+        cache: false
+        message: Mowing did not start. The side gate is not reading open, so Jason MoMower cannot reach the rear yard.
+    - stop: Rear yard requested but the gate does not read open.
+  - action: input_boolean.turn_on
+    alias: Raise the suppression flag before any door movement
+    target:
+      entity_id: input_boolean.mower_cycle_active
+  - alias: Open the door to 21 inches, but ONLY if it is actually shut
+    note: 'BUG FIX 2026-08-17. Without this guard, pressing a zone button while the door was already open sent a second open_cover pulse. On this pulse based opener with no position control that REVERSES a door that is open or stopped partway, so the door closed instead. That is exactly what happened at 12:22:36 on 2026-08-17: the mower was returning from the rear yard, automation.mower_garage_return had correctly opened the door at 12:22:09, then this script re-opened it, the door shut at 12:22:42, and the returning mower hit it and reported Path blocked at 12:24:18. The matching guard was added to automation.mower_garage_return on 2026-08-13; the script never got it.'
+    if:
+    - condition: state
+      entity_id: cover.garage_door
+      state: closed
+    then:
+    - action: cover.open_cover
+      alias: Start the door opening
+      target:
+        entity_id: cover.garage_door
+    - alias: Wait the calibrated interval for a 21 inch opening
+      delay:
+        milliseconds: 2500
+    - action: cover.stop_cover
+      alias: Stop the door partway
+      target:
+        entity_id: cover.garage_door
+  - alias: Let the door settle before commanding the mower
+    delay:
+      seconds: 3
+  - action: dreame_lawn_mower.start_zone_mowing
+    alias: Start the zone mow
+    data:
+      zone_ids: '{{ zone_ids }}'
+    target:
+      entity_id: lawn_mower.jason_momower
+    continue_on_error: true
+    note: 'continue_on_error ADDED 2026-08-25. On the chain run that morning this service RAISED at 08:11:49 with "The mower acknowledged the zone mowing request but did not enter the requested task." The raise aborted the whole script at this step, so the wait for undock, the 120 second clearance delay and the door close never executed, and the garage door was left open with the mower out on the lawn. Scott had to close it by hand. The raise was a FALSE POSITIVE: the mower genuinely started, status_notice read "Mowing task started" at 08:11:50 and the docked flag cleared at 08:11:52, one second after the integration had already given up waiting. Its verification window closes before the mower reports the task. continue_on_error lets the sequence carry on to the undock wait, which is the step that actually confirms the mower left, and which fails safe on its own 5 minute timeout by docking the mower and closing the door. The real verification is not lost, it is done by a step that waits long enough. If the mower truly does not start, the wait times out and the fail-safe branch below handles it exactly as before.'
+  - alias: Wait up to 5 minutes for the mower to leave the dock
+    continue_on_timeout: true
+    timeout:
+      minutes: 5
+    wait_template: '{{ is_state(''binary_sensor.jason_momower_docked'', ''off'') }}'
+    note: 'CHANGED 2026-09-01 from wait_for_trigger to wait_template. This step was the root cause of every short mowing session. wait_for_trigger only sees state transitions that occur AFTER it arms. On 2026-09-01 the docked flag cleared at 09:52:00 but this step did not arm until 09:52:14, because dreame_lawn_mower.start_zone_mowing above blocks while its verification window runs. The undock had already passed, so this waited its full five minutes on a mower that was outside mowing normally, timed out at 09:57:14, and the fail-safe branch below then sent lawn_mower.dock and recalled the mower mid job. Evidence: the integration logged Failed to stop mower session, docking anyway at 09:57:14.805, binary_sensor.jason_momower_returning went on at 09:57:14.903, and the MOVA app showed the session paused and resumable at 10.3 of 434.4 square metres with a Continue button. The same race explains the 2026-08-29 aborts at 6m46s, 5m18s and 5m21s: all were the first session after docking, and every retry ran full length because a warm start_zone_mowing returns fast enough for the old wait to arm before the undock. wait_template is evaluated immediately on entry, so a mower that is already off the dock passes at once and the race cannot happen. This is a deliberate departure from the usual preference for wait_for_trigger, which cannot express this because the transition being waited on may already be in the past. Do not change it back.'
+  - alias: Fail-safe if the mower never left the dock
+    else:
+    - stop: Mower undocked normally. The door close is owned by automation.mower_outbound_door_close, which cannot be killed by this script dying or by a Home Assistant restart.
+    if:
+    - condition: template
+      value_template: '{{ not wait.completed }}'
+    then:
+    - action: lawn_mower.dock
+      alias: Cancel the session so the mower cannot start later into a closed door
+      target:
+        entity_id: lawn_mower.jason_momower
+    - action: cover.close_cover
+      alias: Close the garage door
+      target:
+        entity_id: cover.garage_door
+    - action: script.notify_alert
+      data:
+        message: Jason MoMower did not leave the dock within 5 minutes. The session was cancelled and the garage door has been closed.
+        title: Mower Cycle Failed
+    - action: input_boolean.turn_off
+      alias: Clear the suppression flag
+      target:
+        entity_id: input_boolean.mower_cycle_active
+    - alias: End the script here
+      stop: Mower never undocked
+    note: 'ELSE BRANCH GUTTED 2026-08-25. It used to hold "delay 120 seconds, then close the door", and that is now owned by automation.mower_outbound_door_close. It was moved out because dreame_lawn_mower.start_zone_mowing raises an unexpected exception AFTER the mower has actually started, which aborts this script at that step and took the door close with it twice on 2026-08-25, at 08:11 and 09:37, leaving the garage open with the mower out. continue_on_error does not help because Home Assistant only suppresses HomeAssistantError, not unexpected exceptions. Leaving a duplicate close here would be actively harmful: this is a PULSE opener, so a second close_cover on an already closed door can drive it back open. The THEN branch below still closes the door, and must stay, because if the mower never undocks the automation never triggers and this is the only thing that shuts the door.'
